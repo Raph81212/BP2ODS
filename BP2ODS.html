@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Extracteur Paie vers ODS</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background-color: #f0f2f5; padding: 40px; display: flex; justify-content: center; }
+        .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); width: 100%; max-width: 650px; }
+        h1 { color: #2c3e50; font-size: 22px; text-align: center; margin-bottom: 10px; }
+        p.subtitle { text-align: center; color: #7f8c8d; font-size: 14px; margin-bottom: 25px; }
+        .upload-area { border: 2px dashed #3498db; padding: 45px; text-align: center; border-radius: 10px; background-color: #f8fbff; cursor: pointer; transition: 0.3s; display: block; }
+        .upload-area:hover { background-color: #eef7fe; border-color: #2980b9; }
+        input[type="file"] { display: none; }
+        .btn { background-color: #27ae60; color: white; padding: 15px; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; transition: 0.3s; width: 100%; font-weight: bold; margin-top: 20px; }
+        .btn:hover:not(:disabled) { background-color: #219150; }
+        .btn:disabled { background-color: #bdc3c7; cursor: not-allowed; }
+        #status { margin-top: 20px; font-size: 13px; white-space: pre-wrap; background: #2c3e50; color: #ecf0f1; padding: 15px; border-radius: 6px; display: none; max-height: 250px; overflow-y: auto; font-family: monospace; }
+        .success { color: #2ecc71; font-weight: bold; }
+        .error { color: #ff7675; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<div class="card">
+    <h1>📄 Extracteur de Paie vers ODS</h1>
+    <p class="subtitle">Format LibreOffice • Mode Scanner de l'extrême • 100% Local</p>
+    
+    <label class="upload-area" for="fileInput">
+        <strong id="fileLabel">📁 Cliquez ici pour choisir vos PDF</strong>
+    </label>
+    <input type="file" id="fileInput" multiple accept="application/pdf">
+    
+    <button id="processBtn" class="btn" disabled onclick="processFiles()">Générer le fichier ODS</button>
+    
+    <div id="status"></div>
+</div>
+
+<script>
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+
+    const fileInput = document.getElementById('fileInput');
+    const processBtn = document.getElementById('processBtn');
+    const statusDiv = document.getElementById('status');
+    const fileLabel = document.getElementById('fileLabel');
+
+    fileInput.onchange = () => {
+        if (fileInput.files.length > 0) {
+            fileLabel.textContent = `📁 ${fileInput.files.length} fichier(s) sélectionné(s)`;
+            processBtn.disabled = false;
+        }
+    };
+
+    function log(msg, isError = false) {
+        statusDiv.style.display = 'block';
+        const span = isError ? `<span class="error">${msg}</span>` : msg;
+        statusDiv.innerHTML += span + '<br>';
+        statusDiv.scrollTop = statusDiv.scrollHeight;
+    }
+
+    function parseNum(val) {
+        if (!val) return null;
+        let clean = val.toString().replace(/[^\d,\.-]/g, '').replace(',', '.');
+        let n = parseFloat(clean);
+        return isNaN(n) ? null : n;
+    }
+
+    async function processFiles() {
+        processBtn.disabled = true;
+        statusDiv.innerHTML = '';
+        log("🚀 Démarrage du scanner...");
+
+        try {
+            const wb = XLSX.utils.book_new();
+            let totalSheets = 0;
+
+            for (let file of fileInput.files) {
+                log(`\n📄 <strong>Analyse de :</strong> ${file.name}`);
+                const buffer = await file.arrayBuffer();
+                const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+                
+                let dataRows = [["CODE", "ÉLÉMENTS", "A PAYER", "A DÉDUIRE", "POUR INFORMATION"]];
+                
+                for (let p = 1; p <= pdf.numPages; p++) {
+                    const page = await pdf.getPage(p);
+                    const content = await page.getTextContent();
+                    
+                    // 1. Groupement des lignes
+                    let items = content.items;
+                    items.sort((a, b) => b.transform[5] - a.transform[5]);
+                    let lines = [];
+                    let currentLine = null;
+                    items.forEach(it => {
+                        let y = it.transform[5];
+                        if (!currentLine || Math.abs(currentLine.y - y) > 4) {
+                            currentLine = { y, mots: [] };
+                            lines.push(currentLine);
+                        }
+                        currentLine.mots.push(it);
+                    });
+
+                    // 2. Calibrage des colonnes (à refaire sur chaque page)
+                    let x1Payer = 430, x1Deduire = 505, x1Info = 575;
+                    items.forEach(it => {
+                        let txt = it.str.toUpperCase();
+                        if (txt.includes("PAYER")) x1Payer = it.transform[4] + it.width;
+                        if (txt.includes("DÉDUIRE")) x1Deduire = it.transform[4] + it.width;
+                    });
+                    
+                    let limit1 = (x1Payer + x1Deduire) / 2;
+                    let limit2 = (x1Deduire + x1Info) / 2;
+                    let limitG = x1Payer - 100;
+
+                    // 3. Extraction
+                    let codeActuel = null;
+                    let lib = "", pay = "", ded = "", inf = "";
+
+                    for (let l of lines) {
+                        l.mots.sort((a, b) => a.transform[4] - b.transform[4]);
+                        let lineTxt = l.mots.map(m => m.str).join(" ");
+
+                        // DÉTECTION DU CODE (N'importe où dans la ligne, 4 à 6 chiffres)
+                        let matchCode = lineTxt.match(/(\d{4,6})/);
+
+                        if (matchCode) {
+                            if (codeActuel) dataRows.push([codeActuel, lib.trim(), parseNum(pay), parseNum(ded), parseNum(inf)]);
+                            
+                            codeActuel = matchCode[1];
+                            lib = lineTxt.replace(codeActuel, "").split("€")[0].trim();
+                            pay = ""; ded = ""; inf = "";
+
+                            // On scanne les montants
+                            l.mots.forEach(m => {
+                                let t = m.str.trim();
+                                if (/-?[\d\s]+,\d{2}/.test(t)) {
+                                    let x1 = m.transform[4] + m.width;
+                                    if (x1 < limitG) return;
+                                    if (x1 < limit1) pay = t;
+                                    else if (x1 < limit2) ded = t;
+                                    else inf = t;
+                                }
+                            });
+                        } else if (codeActuel) {
+                            // Fin du tableau ?
+                            if (lineTxt.toUpperCase().includes("TOTAUX") || lineTxt.toUpperCase().includes("VOIR EXPLICATIONS")) {
+                                dataRows.push([codeActuel, lib.trim(), parseNum(pay), parseNum(ded), parseNum(inf)]);
+                                codeActuel = null; continue;
+                            }
+                            // Suite de ligne
+                            l.mots.forEach(m => {
+                                let t = m.str.trim();
+                                if (/-?[\d\s]+,\d{2}/.test(t)) {
+                                    let x1 = m.transform[4] + m.width;
+                                    if (x1 < limitG) return;
+                                    if (x1 < limit1) pay = pay || t;
+                                    else if (x1 < limit1 + 70) ded = ded || t;
+                                    else inf = inf || t;
+                                } else if (t !== "€" && t.length > 2) {
+                                    lib += " " + t;
+                                }
+                            });
+                        }
+                    }
+                    if (codeActuel) dataRows.push([codeActuel, lib.trim(), parseNum(pay), parseNum(ded), parseNum(inf)]);
+                }
+
+                if (dataRows.length > 1) {
+                    const ws = XLSX.utils.aoa_to_sheet(dataRows);
+                    ws['!cols'] = [{wch:10}, {wch:45}, {wch:12}, {wch:12}, {wch:12}];
+                    XLSX.utils.book_append_sheet(wb, ws, file.name.substring(0,31));
+                    totalSheets++;
+                    log(`   <span class="success">✔️ ${dataRows.length - 1} lignes extraites.</span>`);
+                }
+            }
+
+            if (totalSheets > 0) {
+                XLSX.writeFile(wb, "Synthese_Paie.ods", { bookType: 'ods' });
+                log("\n✅ Fichier ODS généré !");
+            } else {
+                log("\n⚠️ Aucun tableau trouvé. Le PDF est peut-être protégé ou illisible.", true);
+            }
+
+        } catch (e) {
+            log("\n🛑 Erreur : " + e.message, true);
+        } finally {
+            processBtn.disabled = false;
+        }
+    }
+</script>
+
+</body>
+</html>
